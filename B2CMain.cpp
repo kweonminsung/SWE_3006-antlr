@@ -16,6 +16,7 @@ string mnemonicTypes[] = {"auto", "int", "double", "string", "bool", "char", "fu
 
 struct SymbolAttributes {
    Types type; // int, double, bool, char, string, function --- auto if unknown yet
+   bool defined = false;
 
    // if type == "function"
    vector<Types> retArgTypes; // first element is a return_type
@@ -41,7 +42,8 @@ public:
         if (symbolExists(name)) {
             return table.at(name);
         } else {
-            cout << "Error: Symbol " << name << " not found" << endl;
+            cerr << "Error: Symbol " << name << " not found" << endl;
+			exit(-1);
         }
     }
 
@@ -83,6 +85,9 @@ const string _GlobalFuncName_ = "$_global_$";
 // symbol table in global scope can be accessed with special name defined in _GlobalFuncName_
 map<string, SymbolTable*> symTabs;
 
+// Maps scope name to the count of blockstmt children for proper numbering
+map<string, int> blockCounters;
+
 
 class SymbolTableVisitor : public BBaseVisitor {
 private:
@@ -121,6 +126,9 @@ public:
 
     any visitAutostmt(BParser::AutostmtContext *ctx) override {
     	// get current symbol table
+		if (symTabs.find(curFuncName) == symTabs.end()) {
+			symTabs[curFuncName] = new SymbolTable();
+		}
 		SymbolTable *stab = symTabs[curFuncName];
 
 		// You can retrieve the variable names and constants using ctx->name(i) and ctx->constant(i)
@@ -128,6 +136,12 @@ public:
 			
 			string varName = ctx->name(i)->getText();
 			enum Types varType = tyAUTO;				// default type
+
+			// Check for duplicate symbol at same scope level
+			if (stab->symbolExists(varName)) {
+				cerr << "[ERROR] Duplicate variable declaration: " << varName << endl;
+				exit(-1);
+			}
 
 			// if initialized, get constant type
 			int idx_assn = 1 + i*2 + j*2 + 1;  // auto name (= const)?, name (= const)?, ...
@@ -138,9 +152,158 @@ public:
 				}
 			}
 
-			stab->addSymbol(varName, {varType});
+			stab->addSymbol(varName, {varType, true});
 		}
     	return nullptr;
+    }
+
+    any visitDeclstmt(BParser::DeclstmtContext *ctx) override {
+		// Function declaration - only in global scope
+		if (symTabs.find(curFuncName) == symTabs.end()) {
+			symTabs[curFuncName] = new SymbolTable();
+		}
+		SymbolTable *stab = symTabs[curFuncName];
+
+		string funcName = ctx->name()->getText();
+
+		// Get argument types (all AUTO)
+		vector<Types> argTypes;
+		argTypes.push_back(tyAUTO);  // return type (first element)
+		
+		// Count AUTO tokens after first one (for arguments)
+		for (int i = 1; i < ctx->AUTO().size(); i++) {
+			argTypes.push_back(tyAUTO);
+		}
+
+		if (stab->symbolExists(funcName)) {
+			SymbolAttributes existingAttr = stab->getSymbolAttributes(funcName);
+			if (existingAttr.type != tyFUNCTION) {
+				cerr << "[ERROR] Duplicate symbol declaration: " << funcName << endl;
+				exit(-1);
+			}
+			if (existingAttr.retArgTypes != argTypes) {
+				cerr << "[ERROR] Conflicting function declaration: " << funcName << endl;
+				exit(-1);
+			}
+			return nullptr;
+		}
+
+		SymbolAttributes funcAttr;
+		funcAttr.type = tyFUNCTION;
+		funcAttr.defined = false;
+		funcAttr.retArgTypes = argTypes;
+		stab->addSymbol(funcName, funcAttr);
+
+		return nullptr;
+    }
+
+    any visitFuncdef(BParser::FuncdefContext *ctx) override {
+		// Get current scope
+		string symTabName = curFuncName;
+		if (symTabs.find(symTabName) == symTabs.end()) {
+			symTabs[symTabName] = new SymbolTable();
+		}
+		SymbolTable *stab = symTabs[symTabName];
+
+		string funcName = ctx->name(0)->getText();
+
+		// Get argument types and names
+		vector<Types> funcTypes;
+		funcTypes.push_back(tyAUTO);  // return type (first element)
+		
+		// Count AUTO tokens for arguments
+		for (int i = 1; i < ctx->AUTO().size(); i++) {
+			funcTypes.push_back(tyAUTO);
+		}
+
+		if (stab->symbolExists(funcName)) {
+			SymbolAttributes existingAttr = stab->getSymbolAttributes(funcName);
+			if (existingAttr.type != tyFUNCTION) {
+				cerr << "[ERROR] Duplicate symbol declaration: " << funcName << endl;
+				exit(-1);
+			}
+			if (existingAttr.retArgTypes != funcTypes) {
+				cerr << "[ERROR] Conflicting function definition: " << funcName << endl;
+				exit(-1);
+			}
+			if (existingAttr.defined) {
+				cerr << "[ERROR] Duplicate function definition: " << funcName << endl;
+				exit(-1);
+			}
+		}
+
+		SymbolAttributes funcAttr;
+		funcAttr.type = tyFUNCTION;
+		funcAttr.defined = true;
+		funcAttr.retArgTypes = funcTypes;
+		stab->addSymbol(funcName, funcAttr);  // This overwrites any declaration
+
+		// Create new symbol table for function body
+		string prevFuncName = curFuncName;
+		curFuncName = funcName;
+		
+		// Create function's symbol table
+		if (symTabs.find(funcName) == symTabs.end()) {
+			symTabs[funcName] = new SymbolTable();
+		}
+		SymbolTable *funcSymTab = symTabs[funcName];
+
+		// Add parameters to function's symbol table
+		for (int i = 1; i < ctx->name().size(); i++) {
+			string paramName = ctx->name(i)->getText();
+			if (funcSymTab->symbolExists(paramName)) {
+				cerr << "[ERROR] Duplicate parameter name: " << paramName << endl;
+				exit(-1);
+			}
+			funcSymTab->addSymbol(paramName, {tyAUTO, true});
+		}
+
+		// Visit function body (blockstmt) - directly process statements
+		for (auto stmt : ctx->blockstmt()->statement()) {
+			visit(stmt);
+		}
+
+		// Restore previous function context
+		curFuncName = prevFuncName;
+
+		return nullptr;
+    }
+
+    any visitBlockstmt(BParser::BlockstmtContext *ctx) override {
+		// Make a new scope name for this block
+		int nextBlockNum = ++blockCounters[curFuncName];
+		
+		string blockScopeName;
+		if (curFuncName.find("_$") == string::npos && curFuncName.find("_") == string::npos) {
+			// Current scope is a function scope
+			blockScopeName = curFuncName + "_$" + to_string(nextBlockNum);
+		} else {
+			// Current scope is already a nested block scope
+			blockScopeName = curFuncName + "_" + to_string(nextBlockNum);
+		}
+
+		if (symTabs.find(blockScopeName) == symTabs.end()) {
+			symTabs[blockScopeName] = new SymbolTable();
+		}
+
+		// Save current scope and switch to block scope
+		string prevFuncName = curFuncName;
+		curFuncName = blockScopeName;
+
+		// Visit all statements in block
+		for (auto stmt : ctx->statement()) {
+			visit(stmt);
+		}
+
+		// Restore previous scope
+		curFuncName = prevFuncName;
+
+		return nullptr;
+    }
+
+    any visitStatement(BParser::StatementContext *ctx) override {
+		visit(ctx->children[0]);
+        return nullptr;
     }
 
     any visitConstant(BParser::ConstantContext *ctx) override {
