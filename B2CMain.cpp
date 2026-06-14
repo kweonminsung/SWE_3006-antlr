@@ -1,7 +1,11 @@
 // B2CMain.cpp
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <map>
-#include <stack>
+#include <string>
+#include <vector>
+
 #include "antlr4-runtime.h"
 #include "antlr4-cpp/BBaseVisitor.h"
 #include "antlr4-cpp/BLexer.h"
@@ -11,424 +15,831 @@ using namespace std;
 using namespace antlr4;
 using namespace antlr4::tree;
 
-enum Types {tyAUTO, tyINT, tyDOUBLE, tySTRING, tyBOOL, tyCHAR, tyFUNCTION};
-string mnemonicTypes[] = {"auto", "int", "double", "string", "bool", "char", "function"};
+enum Types {tyAUTO, tyINT, tyDOUBLE, tySTRING, tyBOOL, tyCHAR, tyVOID, tyFUNCTION};
+string mnemonicTypes[] = {"auto", "int", "double", "string", "bool", "char", "void", "function"};
 
 struct SymbolAttributes {
-   Types type; // int, double, bool, char, string, function --- auto if unknown yet
-   bool defined = false;
+    Types type; // int, double, bool, char, string, function --- auto if unknown yet
+    bool defined = false;
+    int line = 0;
 
-   // if type == "function"
-   vector<Types> retArgTypes; // first element is a return_type
+    // if type == function, first element is the return type and the rest are argument types
+    vector<Types> retArgTypes;
 };
+
+static void print_error_and_exit(int line, const string& message) {
+    cerr << "[ERROR] line " << line << ": " << message << endl;
+    exit(-1);
+}
 
 class SymbolTable {
 private:
-    map<string, SymbolAttributes> table;  // symbol-name: string, symbol-typeInfo: SymbolAttributes
+    map<string, SymbolAttributes> table;
 
 public:
-    // Add a new symbol 
     void addSymbol(const string& name, const SymbolAttributes& attributes) {
-		table[name] = attributes; 
+        table[name] = attributes;
     }
 
-    // Check if a symbol exists
     bool symbolExists(const string& name) const {
         return table.find(name) != table.end();
     }
 
-    // Get attributes of a symbol
     SymbolAttributes getSymbolAttributes(const string& name) const {
-        if (symbolExists(name)) {
-            return table.at(name);
-        } else {
-            cerr << "Error: Symbol " << name << " not found" << endl;
-			exit(-1);
+        auto it = table.find(name);
+        if (it != table.end()) {
+            return it->second;
         }
+        cerr << "Error: Symbol " << name << " not found" << endl;
+        exit(-1);
     }
 
-    // Remove a symbol from the table
-    void removeSymbol(const string& name) {
-        table.erase(name);
+    void setSymbolAttributes(const string& name, const SymbolAttributes& attributes) {
+        table[name] = attributes;
     }
 
-    // Print all symbols in the table (for debugging purposes)
+    const map<string, SymbolAttributes>& symbols() const {
+        return table;
+    }
+
     void printSymbols() const {
         for (const auto& pair : table) {
             cout << "(name) " << pair.first << ", (type) " << mnemonicTypes[pair.second.type];
-			if (pair.second.type == tyFUNCTION) {
-				cout << "| ";
-				int n = pair.second.retArgTypes.size();
-				if (n > 0) {
-					cout << mnemonicTypes[pair.second.retArgTypes[0]] << "("; // return type
-				}
-				for (int i = 1; i < n-1; i++)
-					cout << mnemonicTypes[pair.second.retArgTypes[i]] << ", ";
-				if (n > 1) {
-					cout << mnemonicTypes[pair.second.retArgTypes[n-1]]; // last arg type
-				}
-				cout << ")";
-			} 
-	    	cout << endl;
+            if (pair.second.type == tyFUNCTION) {
+                cout << "| ";
+                int n = static_cast<int>(pair.second.retArgTypes.size());
+                if (n > 0) {
+                    cout << mnemonicTypes[pair.second.retArgTypes[0]] << "(";
+                }
+                for (int i = 1; i < n - 1; i++) {
+                    cout << mnemonicTypes[pair.second.retArgTypes[i]] << ", ";
+                }
+                if (n > 1) {
+                    cout << mnemonicTypes[pair.second.retArgTypes[n - 1]];
+                }
+                cout << ")";
+            }
+            cout << endl;
         }
     }
 };
-
-
 
 /*
  * STEP 1. build symbol table
  */
 const string _GlobalFuncName_ = "$_global_$";
 
-// collection of per-function symbol tables accessed by function name
-// symbol table in global scope can be accessed with special name defined in _GlobalFuncName_
 map<string, SymbolTable*> symTabs;
-
-// Maps scope name to the count of blockstmt children for proper numbering
 map<string, int> blockCounters;
+map<string, string> scopeParents;
+map<string, vector<string>> functionParams;
 
+static Types constantType(BParser::ConstantContext *ctx) {
+    if (ctx->INT()) return tyINT;
+    if (ctx->REAL()) return tyDOUBLE;
+    if (ctx->STRING()) return tySTRING;
+    if (ctx->BOOL()) return tyBOOL;
+    if (ctx->CHAR()) return tyCHAR;
+    print_error_and_exit(ctx->getStart()->getLine(), "unrecognizable constant");
+    return tyAUTO;
+}
+
+static bool autostmtHasInitializer(BParser::AutostmtContext *ctx, int nameIndex) {
+    for (size_t i = 0; i < ctx->children.size(); i++) {
+        if (ctx->children[i] == ctx->name(nameIndex)) {
+            return i + 1 < ctx->children.size() && ctx->children[i + 1]->getText() == "=";
+        }
+    }
+    return false;
+}
+
+static int initializerIndexForName(BParser::AutostmtContext *ctx, int nameIndex) {
+    int index = 0;
+    for (int i = 0; i < nameIndex; i++) {
+        if (autostmtHasInitializer(ctx, i)) {
+            index++;
+        }
+    }
+    return index;
+}
+
+static string nextBlockScope(const string& parentScope) {
+    int next = ++blockCounters[parentScope];
+    return parentScope + "$" + to_string(next);
+}
+
+static SymbolTable* ensureScope(const string& scope) {
+    if (symTabs.find(scope) == symTabs.end()) {
+        symTabs[scope] = new SymbolTable();
+    }
+    return symTabs[scope];
+}
+
+static bool lookupSymbol(const string& startScope, const string& name, string& foundScope, SymbolAttributes& attr) {
+    string scope = startScope;
+    while (!scope.empty()) {
+        auto tableIt = symTabs.find(scope);
+        if (tableIt != symTabs.end() && tableIt->second->symbolExists(name)) {
+            foundScope = scope;
+            attr = tableIt->second->getSymbolAttributes(name);
+            return true;
+        }
+        auto parentIt = scopeParents.find(scope);
+        if (parentIt == scopeParents.end()) {
+            break;
+        }
+        scope = parentIt->second;
+    }
+    return false;
+}
+
+static bool getGlobalFunction(const string& name, SymbolAttributes& attr) {
+    auto it = symTabs.find(_GlobalFuncName_);
+    if (it == symTabs.end() || !it->second->symbolExists(name)) {
+        return false;
+    }
+    attr = it->second->getSymbolAttributes(name);
+    return attr.type == tyFUNCTION;
+}
+
+static void setGlobalFunction(const string& name, const SymbolAttributes& attr) {
+    ensureScope(_GlobalFuncName_)->setSymbolAttributes(name, attr);
+}
 
 class SymbolTableVisitor : public BBaseVisitor {
 private:
-   int scopeLevel;
-   string curFuncName;
+    string curScope;
+
+    void addFunctionSymbol(const string& funcName, const vector<Types>& funcTypes,
+                           bool isDefinition, int line) {
+        SymbolTable *global = ensureScope(_GlobalFuncName_);
+
+        if (global->symbolExists(funcName)) {
+            SymbolAttributes existingAttr = global->getSymbolAttributes(funcName);
+            if (existingAttr.type != tyFUNCTION) {
+                print_error_and_exit(line, "duplicate symbol declaration: " + funcName);
+            }
+            if (existingAttr.retArgTypes.size() != funcTypes.size()) {
+                print_error_and_exit(line, "conflicting function declaration: " + funcName);
+            }
+            if (isDefinition && existingAttr.defined) {
+                print_error_and_exit(line, "duplicate function definition: " + funcName);
+            }
+            existingAttr.defined = existingAttr.defined || isDefinition;
+            global->setSymbolAttributes(funcName, existingAttr);
+            return;
+        }
+
+        SymbolAttributes funcAttr;
+        funcAttr.type = tyFUNCTION;
+        funcAttr.defined = isDefinition;
+        funcAttr.line = line;
+        funcAttr.retArgTypes = funcTypes;
+        global->addSymbol(funcName, funcAttr);
+    }
+
 public:
-	// Building symbol tables by visiting tree
-	
-	any visitProgram(BParser::ProgramContext *ctx) override {
-		scopeLevel = 0; // global scope	
-			
-		// prepare symbol table for global scope
-		SymbolTable* globalSymTab = new SymbolTable();
-		curFuncName = _GlobalFuncName_;
-    	symTabs[curFuncName] = globalSymTab;
+    any visitProgram(BParser::ProgramContext *ctx) override {
+        symTabs.clear();
+        blockCounters.clear();
+        scopeParents.clear();
+        functionParams.clear();
 
-		// visit children
-    	for (int i=0; i< ctx->children.size(); i++) {
-    		visit(ctx->children[i]);
-    	}
+        curScope = _GlobalFuncName_;
+        ensureScope(curScope);
+        scopeParents[curScope] = "";
 
-		// print all symbol tables
-		for (auto& pair : symTabs) {
-	    	cout << "--- Symbol Table --- " << pair.first << endl; // function name
-	    	pair.second->printSymbols();					   // per-function symbol table
-			cout << "";
-		}
-
-    	return nullptr;
-	}
+        for (auto child : ctx->children) {
+            visit(child);
+        }
+        return nullptr;
+    }
 
     any visitDefinition(BParser::DefinitionContext *ctx) override {
-		visit(ctx->children[0]);
+        visit(ctx->children[0]);
         return nullptr;
-	}
+    }
 
     any visitAutostmt(BParser::AutostmtContext *ctx) override {
-    	// get current symbol table
-		if (symTabs.find(curFuncName) == symTabs.end()) {
-			symTabs[curFuncName] = new SymbolTable();
-		}
-		SymbolTable *stab = symTabs[curFuncName];
+        SymbolTable *stab = ensureScope(curScope);
 
-		// You can retrieve the variable names and constants using ctx->name(i) and ctx->constant(i)
-		for (int i=0, j=0; i < ctx->name().size(); i++) {
-			
-			string varName = ctx->name(i)->getText();
-			enum Types varType = tyAUTO;				// default type
+        for (int i = 0; i < static_cast<int>(ctx->name().size()); i++) {
+            string varName = ctx->name(i)->getText();
+            if (stab->symbolExists(varName)) {
+                print_error_and_exit(ctx->name(i)->getStart()->getLine(),
+                                     "duplicate variable declaration: " + varName);
+            }
 
-			// Check for duplicate symbol at same scope level
-			if (stab->symbolExists(varName)) {
-				cerr << "[ERROR] Duplicate variable declaration: " << varName << endl;
-				exit(-1);
-			}
-
-			// if initialized, get constant type
-			int idx_assn = 1 + i*2 + j*2 + 1;  // auto name (= const)?, name (= const)?, ...
-			if (ctx->children[idx_assn]->getText().compare("=") == 0) { 
-				if (ctx->constant(j)) {  
-					varType = any_cast<Types>( visit(ctx->constant(j)) );   // returns init constant type
-					j++;
-				}
-			}
-
-			stab->addSymbol(varName, {varType, true});
-		}
-    	return nullptr;
+            Types varType = tyAUTO;
+            if (autostmtHasInitializer(ctx, i)) {
+                varType = constantType(ctx->constant(initializerIndexForName(ctx, i)));
+            }
+            SymbolAttributes varAttr;
+            varAttr.type = varType;
+            varAttr.defined = true;
+            varAttr.line = ctx->name(i)->getStart()->getLine();
+            stab->addSymbol(varName, varAttr);
+        }
+        return nullptr;
     }
 
     any visitDeclstmt(BParser::DeclstmtContext *ctx) override {
-		// Function declaration - only in global scope
-		if (symTabs.find(curFuncName) == symTabs.end()) {
-			symTabs[curFuncName] = new SymbolTable();
-		}
-		SymbolTable *stab = symTabs[curFuncName];
+        if (curScope != _GlobalFuncName_) {
+            print_error_and_exit(ctx->getStart()->getLine(),
+                                 "function declaration is only allowed in global scope");
+        }
 
-		string funcName = ctx->name()->getText();
-
-		// Get argument types (all AUTO)
-		vector<Types> argTypes;
-		argTypes.push_back(tyAUTO);  // return type (first element)
-		
-		// Count AUTO tokens after first one (for arguments)
-		for (int i = 1; i < ctx->AUTO().size(); i++) {
-			argTypes.push_back(tyAUTO);
-		}
-
-		if (stab->symbolExists(funcName)) {
-			SymbolAttributes existingAttr = stab->getSymbolAttributes(funcName);
-			if (existingAttr.type != tyFUNCTION) {
-				cerr << "[ERROR] Duplicate symbol declaration: " << funcName << endl;
-				exit(-1);
-			}
-			if (existingAttr.retArgTypes != argTypes) {
-				cerr << "[ERROR] Conflicting function declaration: " << funcName << endl;
-				exit(-1);
-			}
-			return nullptr;
-		}
-
-		SymbolAttributes funcAttr;
-		funcAttr.type = tyFUNCTION;
-		funcAttr.defined = false;
-		funcAttr.retArgTypes = argTypes;
-		stab->addSymbol(funcName, funcAttr);
-
-		return nullptr;
+        vector<Types> funcTypes(ctx->AUTO().size(), tyAUTO);
+        addFunctionSymbol(ctx->name()->getText(), funcTypes, false, ctx->name()->getStart()->getLine());
+        return nullptr;
     }
 
     any visitFuncdef(BParser::FuncdefContext *ctx) override {
-		// Get current scope
-		string symTabName = curFuncName;
-		if (symTabs.find(symTabName) == symTabs.end()) {
-			symTabs[symTabName] = new SymbolTable();
-		}
-		SymbolTable *stab = symTabs[symTabName];
+        if (curScope != _GlobalFuncName_) {
+            print_error_and_exit(ctx->getStart()->getLine(),
+                                 "function definition is only allowed in global scope");
+        }
 
-		string funcName = ctx->name(0)->getText();
+        string funcName = ctx->name(0)->getText();
+        vector<Types> funcTypes(ctx->AUTO().size(), tyAUTO);
+        addFunctionSymbol(funcName, funcTypes, true, ctx->name(0)->getStart()->getLine());
 
-		// Get argument types and names
-		vector<Types> funcTypes;
-		funcTypes.push_back(tyAUTO);  // return type (first element)
-		
-		// Count AUTO tokens for arguments
-		for (int i = 1; i < ctx->AUTO().size(); i++) {
-			funcTypes.push_back(tyAUTO);
-		}
+        string prevScope = curScope;
+        curScope = funcName;
+        ensureScope(curScope);
+        scopeParents[curScope] = _GlobalFuncName_;
 
-		if (stab->symbolExists(funcName)) {
-			SymbolAttributes existingAttr = stab->getSymbolAttributes(funcName);
-			if (existingAttr.type != tyFUNCTION) {
-				cerr << "[ERROR] Duplicate symbol declaration: " << funcName << endl;
-				exit(-1);
-			}
-			if (existingAttr.retArgTypes != funcTypes) {
-				cerr << "[ERROR] Conflicting function definition: " << funcName << endl;
-				exit(-1);
-			}
-			if (existingAttr.defined) {
-				cerr << "[ERROR] Duplicate function definition: " << funcName << endl;
-				exit(-1);
-			}
-		}
+        vector<string> params;
+        SymbolTable *funcSymTab = ensureScope(curScope);
+        for (int i = 1; i < static_cast<int>(ctx->name().size()); i++) {
+            string paramName = ctx->name(i)->getText();
+            if (funcSymTab->symbolExists(paramName)) {
+                print_error_and_exit(ctx->name(i)->getStart()->getLine(),
+                                     "duplicate parameter name: " + paramName);
+            }
+            params.push_back(paramName);
+            SymbolAttributes paramAttr;
+            paramAttr.type = tyAUTO;
+            paramAttr.defined = true;
+            paramAttr.line = ctx->name(i)->getStart()->getLine();
+            funcSymTab->addSymbol(paramName, paramAttr);
+        }
+        functionParams[funcName] = params;
 
-		SymbolAttributes funcAttr;
-		funcAttr.type = tyFUNCTION;
-		funcAttr.defined = true;
-		funcAttr.retArgTypes = funcTypes;
-		stab->addSymbol(funcName, funcAttr);  // This overwrites any declaration
+        for (auto stmt : ctx->blockstmt()->statement()) {
+            visit(stmt);
+        }
 
-		// Create new symbol table for function body
-		string prevFuncName = curFuncName;
-		curFuncName = funcName;
-		
-		// Create function's symbol table
-		if (symTabs.find(funcName) == symTabs.end()) {
-			symTabs[funcName] = new SymbolTable();
-		}
-		SymbolTable *funcSymTab = symTabs[funcName];
-
-		// Add parameters to function's symbol table
-		for (int i = 1; i < ctx->name().size(); i++) {
-			string paramName = ctx->name(i)->getText();
-			if (funcSymTab->symbolExists(paramName)) {
-				cerr << "[ERROR] Duplicate parameter name: " << paramName << endl;
-				exit(-1);
-			}
-			funcSymTab->addSymbol(paramName, {tyAUTO, true});
-		}
-
-		// Visit function body (blockstmt) - directly process statements
-		for (auto stmt : ctx->blockstmt()->statement()) {
-			visit(stmt);
-		}
-
-		// Restore previous function context
-		curFuncName = prevFuncName;
-
-		return nullptr;
+        curScope = prevScope;
+        return nullptr;
     }
 
     any visitBlockstmt(BParser::BlockstmtContext *ctx) override {
-		// Make a new scope name for this block
-		int nextBlockNum = ++blockCounters[curFuncName];
-		
-		string blockScopeName;
-		if (curFuncName.find("_$") == string::npos && curFuncName.find("_") == string::npos) {
-			// Current scope is a function scope
-			blockScopeName = curFuncName + "_$" + to_string(nextBlockNum);
-		} else {
-			// Current scope is already a nested block scope
-			blockScopeName = curFuncName + "_" + to_string(nextBlockNum);
-		}
+        string blockScope = nextBlockScope(curScope);
+        ensureScope(blockScope);
+        scopeParents[blockScope] = curScope;
 
-		if (symTabs.find(blockScopeName) == symTabs.end()) {
-			symTabs[blockScopeName] = new SymbolTable();
-		}
+        string prevScope = curScope;
+        curScope = blockScope;
+        for (auto stmt : ctx->statement()) {
+            visit(stmt);
+        }
+        curScope = prevScope;
 
-		// Save current scope and switch to block scope
-		string prevFuncName = curFuncName;
-		curFuncName = blockScopeName;
-
-		// Visit all statements in block
-		for (auto stmt : ctx->statement()) {
-			visit(stmt);
-		}
-
-		// Restore previous scope
-		curFuncName = prevFuncName;
-
-		return nullptr;
+        return nullptr;
     }
 
     any visitStatement(BParser::StatementContext *ctx) override {
-		visit(ctx->children[0]);
+        visit(ctx->children[0]);
         return nullptr;
     }
-
-    any visitConstant(BParser::ConstantContext *ctx) override {
-        
-		if (ctx->INT()) return tyINT;
-		else if (ctx->REAL()) return tyDOUBLE;
-		else if (ctx->STRING()) return tySTRING;
-		else if (ctx->BOOL()) return tyBOOL;
-		else if (ctx->CHAR()) return tyCHAR;
-
-		cout << "[ERROR] unrecognizable constant is used for initialization: " << ctx->children[0]->getText() << endl;
-		exit(-1);
-        return nullptr;
-    }
-
 };
 
 /*
  * STEP 2. infer type
- */   
+ */
 class TypeAnalysisVisitor : public BBaseVisitor {
+private:
+    string curScope;
+    string curFuncName;
+    bool changed = false;
+    bool sawReturn = false;
+
+    bool isKnown(Types type) const {
+        return type != tyAUTO;
+    }
+
+    bool isValueType(Types type) const {
+        return type != tyAUTO && type != tyVOID && type != tyFUNCTION;
+    }
+
+    void requireValueType(Types type, int line, const string& context) {
+        if (type == tyVOID || type == tyFUNCTION) {
+            print_error_and_exit(line, "invalid " + context + " type: " + mnemonicTypes[type]);
+        }
+    }
+
+    void assignVariableType(const string& name, Types rhsType, int line) {
+        if (!isKnown(rhsType)) {
+            return;
+        }
+        if (rhsType == tyVOID || rhsType == tyFUNCTION) {
+            print_error_and_exit(line, "invalid assignment from " + mnemonicTypes[rhsType]);
+        }
+
+        string foundScope;
+        SymbolAttributes attr;
+        if (!lookupSymbol(curScope, name, foundScope, attr) || attr.type == tyFUNCTION) {
+            print_error_and_exit(line, "undefined variable: " + name);
+        }
+
+        if (attr.type == tyAUTO) {
+            attr.type = rhsType;
+            symTabs[foundScope]->setSymbolAttributes(name, attr);
+            changed = true;
+        } else if (attr.type != rhsType) {
+            print_error_and_exit(line, "type mismatch for variable " + name);
+        }
+    }
+
+    Types readVariableType(const string& name, int line) {
+        string foundScope;
+        SymbolAttributes attr;
+        if (!lookupSymbol(curScope, name, foundScope, attr) || attr.type == tyFUNCTION) {
+            print_error_and_exit(line, "undefined variable: " + name);
+        }
+        return attr.type;
+    }
+
+    void updateFunctionParam(const string& funcName, int paramIndex, Types argType, int line) {
+        if (!isKnown(argType)) {
+            return;
+        }
+        requireValueType(argType, line, "parameter");
+
+        SymbolAttributes funcAttr;
+        if (!getGlobalFunction(funcName, funcAttr)) {
+            return;
+        }
+
+        Types currentType = funcAttr.retArgTypes[paramIndex + 1];
+        if (currentType == tyAUTO) {
+            funcAttr.retArgTypes[paramIndex + 1] = argType;
+            setGlobalFunction(funcName, funcAttr);
+            changed = true;
+
+            auto paramsIt = functionParams.find(funcName);
+            if (paramsIt != functionParams.end() && paramIndex < static_cast<int>(paramsIt->second.size())) {
+                SymbolTable *funcTable = ensureScope(funcName);
+                string paramName = paramsIt->second[paramIndex];
+                if (funcTable->symbolExists(paramName)) {
+                    SymbolAttributes paramAttr = funcTable->getSymbolAttributes(paramName);
+                    paramAttr.type = argType;
+                    funcTable->setSymbolAttributes(paramName, paramAttr);
+                }
+            }
+        } else if (currentType != argType) {
+            print_error_and_exit(line, "parameter type mismatch in call to " + funcName);
+        }
+    }
+
+    void updateFunctionReturn(const string& funcName, Types returnType, int line) {
+        if (!isKnown(returnType)) {
+            return;
+        }
+        if (returnType == tyFUNCTION) {
+            print_error_and_exit(line, "invalid function return type");
+        }
+
+        SymbolAttributes funcAttr;
+        if (!getGlobalFunction(funcName, funcAttr)) {
+            return;
+        }
+
+        Types currentType = funcAttr.retArgTypes[0];
+        if (currentType == tyAUTO) {
+            funcAttr.retArgTypes[0] = returnType;
+            setGlobalFunction(funcName, funcAttr);
+            changed = true;
+        } else if (currentType != returnType) {
+            print_error_and_exit(line, "return type mismatch in function " + funcName);
+        }
+    }
+
+    Types inferFuncInvocation(BParser::FuncinvocationContext *ctx, Types expectedType) {
+        string funcName = ctx->name()->getText();
+        int line = ctx->name()->getStart()->getLine();
+
+        SymbolAttributes funcAttr;
+        if (!getGlobalFunction(funcName, funcAttr)) {
+            for (auto expr : ctx->expr()) {
+                inferExpr(expr, tyAUTO);
+            }
+            return expectedType;
+        }
+
+        int expectedArgs = static_cast<int>(funcAttr.retArgTypes.size()) - 1;
+        int actualArgs = static_cast<int>(ctx->expr().size());
+        if (expectedArgs != actualArgs) {
+            print_error_and_exit(line, "parameter count mismatch in call to " + funcName);
+        }
+
+        for (int i = 0; i < actualArgs; i++) {
+            Types paramType = funcAttr.retArgTypes[i + 1];
+            Types argType = inferExpr(ctx->expr(i), paramType);
+
+            if (paramType == tyAUTO && isKnown(argType)) {
+                updateFunctionParam(funcName, i, argType, line);
+                getGlobalFunction(funcName, funcAttr);
+                paramType = funcAttr.retArgTypes[i + 1];
+            }
+
+            if (isKnown(paramType) && isKnown(argType) && paramType != argType) {
+                print_error_and_exit(line, "parameter type mismatch in call to " + funcName);
+            }
+        }
+
+        return funcAttr.retArgTypes[0];
+    }
+
+    Types inferAtom(BParser::AtomContext *ctx, Types expectedType) {
+        if (ctx->constant()) {
+            return constantType(ctx->constant());
+        }
+        if (ctx->name()) {
+            return readVariableType(ctx->name()->getText(), ctx->name()->getStart()->getLine());
+        }
+        if (ctx->expression()) {
+            return inferExpression(ctx->expression(), expectedType);
+        }
+        if (ctx->funcinvocation()) {
+            return inferFuncInvocation(ctx->funcinvocation(), expectedType);
+        }
+        return tyAUTO;
+    }
+
+    Types inferExpr(BParser::ExprContext *ctx, Types expectedType = tyAUTO) {
+        int line = ctx->getStart()->getLine();
+
+        if (ctx->atom()) {
+            Types type = inferAtom(ctx->atom(), expectedType);
+            if (ctx->NOT()) {
+                if (isKnown(type) && type != tyBOOL) {
+                    print_error_and_exit(line, "operator ! requires bool");
+                }
+                return tyBOOL;
+            }
+            if (ctx->PLUS() || ctx->MINUS()) {
+                if (isKnown(type) && (type == tyBOOL || type == tySTRING || type == tyVOID || type == tyFUNCTION)) {
+                    print_error_and_exit(line, "invalid unary operand type");
+                }
+                return type;
+            }
+            return type;
+        }
+
+        if (ctx->AND() || ctx->OR()) {
+            Types left = inferExpr(ctx->expr(0), tyBOOL);
+            Types right = inferExpr(ctx->expr(1), tyBOOL);
+            if ((isKnown(left) && left != tyBOOL) || (isKnown(right) && right != tyBOOL)) {
+                print_error_and_exit(line, "logical operators require bool operands");
+            }
+            return tyBOOL;
+        }
+
+        if (ctx->QUEST()) {
+            Types cond = inferExpr(ctx->expr(0), tyBOOL);
+            if (isKnown(cond) && cond != tyBOOL) {
+                print_error_and_exit(line, "ternary condition must be bool");
+            }
+
+            Types trueType = inferExpr(ctx->expr(1), expectedType);
+            Types falseExpected = isKnown(trueType) ? trueType : expectedType;
+            Types falseType = inferExpr(ctx->expr(2), falseExpected);
+            if (!isKnown(trueType) && isKnown(falseType)) {
+                trueType = inferExpr(ctx->expr(1), falseType);
+            }
+            if (isKnown(trueType)) {
+                requireValueType(trueType, line, "ternary branch");
+            }
+            if (isKnown(falseType)) {
+                requireValueType(falseType, line, "ternary branch");
+            }
+            if (isKnown(trueType) && isKnown(falseType) && trueType != falseType) {
+                print_error_and_exit(line, "ternary branch type mismatch");
+            }
+            return isKnown(trueType) ? trueType : falseType;
+        }
+
+        Types left = inferExpr(ctx->expr(0), tyAUTO);
+        Types rightExpected = isKnown(left) ? left : tyAUTO;
+        Types right = inferExpr(ctx->expr(1), rightExpected);
+        if (!isKnown(left) && isKnown(right)) {
+            left = inferExpr(ctx->expr(0), right);
+        }
+
+        if (isKnown(left) && isKnown(right) && left != right) {
+            print_error_and_exit(line, "binary operand type mismatch");
+        }
+        if (isKnown(left)) {
+            requireValueType(left, line, "binary operand");
+        }
+        if (isKnown(right)) {
+            requireValueType(right, line, "binary operand");
+        }
+
+        if (ctx->GT() || ctx->GTE() || ctx->LT() || ctx->LTE() || ctx->EQ() || ctx->NEQ()) {
+            return tyBOOL;
+        }
+
+        return isKnown(left) ? left : right;
+    }
+
+    Types inferExpression(BParser::ExpressionContext *ctx, Types expectedType = tyAUTO) {
+        int line = ctx->getStart()->getLine();
+        if (ctx->ASSN()) {
+            string lhsName = ctx->name()->getText();
+            Types lhsType = readVariableType(lhsName, ctx->name()->getStart()->getLine());
+            Types rhsType = inferExpr(ctx->expr(), lhsType);
+            if (!isKnown(rhsType) && isKnown(expectedType)) {
+                rhsType = inferExpr(ctx->expr(), expectedType);
+            }
+            assignVariableType(lhsName, rhsType, line);
+            return isKnown(lhsType) ? lhsType : rhsType;
+        }
+        return inferExpr(ctx->expr(), expectedType);
+    }
+
+    void validateUndefinedTypes() {
+        for (const auto& scopePair : symTabs) {
+            for (const auto& symbolPair : scopePair.second->symbols()) {
+                const string& name = symbolPair.first;
+                const SymbolAttributes& attr = symbolPair.second;
+
+                if (attr.type == tyAUTO) {
+                    print_error_and_exit(attr.line, "undefined type for variable " + name);
+                }
+
+                if (attr.type == tyFUNCTION) {
+                    if (!attr.defined) {
+                        print_error_and_exit(attr.line, "undefined function: " + name);
+                    }
+                    for (int i = 0; i < static_cast<int>(attr.retArgTypes.size()); i++) {
+                        if (attr.retArgTypes[i] == tyAUTO) {
+                            print_error_and_exit(attr.line, "undefined type for function " + name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 public:
-   // infer types for 'auto' variables and functions
-   // ...
+    bool didChange() const {
+        return changed;
+    }
+
+    void finalize() {
+        validateUndefinedTypes();
+    }
+
+    any visitProgram(BParser::ProgramContext *ctx) override {
+        changed = false;
+        blockCounters.clear();
+        curScope = _GlobalFuncName_;
+        curFuncName = "";
+
+        for (auto child : ctx->children) {
+            visit(child);
+        }
+        return nullptr;
+    }
+
+    any visitDefinition(BParser::DefinitionContext *ctx) override {
+        visit(ctx->children[0]);
+        return nullptr;
+    }
+
+    any visitFuncdef(BParser::FuncdefContext *ctx) override {
+        string prevScope = curScope;
+        string prevFunc = curFuncName;
+        bool prevSawReturn = sawReturn;
+
+        curFuncName = ctx->name(0)->getText();
+        curScope = curFuncName;
+        sawReturn = false;
+
+        for (auto stmt : ctx->blockstmt()->statement()) {
+            visit(stmt);
+        }
+
+        if (!sawReturn) {
+            updateFunctionReturn(curFuncName, tyVOID, ctx->name(0)->getStart()->getLine());
+        }
+
+        curScope = prevScope;
+        curFuncName = prevFunc;
+        sawReturn = prevSawReturn;
+        return nullptr;
+    }
+
+    any visitBlockstmt(BParser::BlockstmtContext *ctx) override {
+        string blockScope = nextBlockScope(curScope);
+        string prevScope = curScope;
+        curScope = blockScope;
+
+        for (auto stmt : ctx->statement()) {
+            visit(stmt);
+        }
+
+        curScope = prevScope;
+        return nullptr;
+    }
+
+    any visitStatement(BParser::StatementContext *ctx) override {
+        visit(ctx->children[0]);
+        return nullptr;
+    }
+
+    any visitExpressionstmt(BParser::ExpressionstmtContext *ctx) override {
+        inferExpression(ctx->expression(), tyAUTO);
+        return nullptr;
+    }
+
+    any visitReturnstmt(BParser::ReturnstmtContext *ctx) override {
+        sawReturn = true;
+        Types returnType = tyVOID;
+        if (ctx->expression()) {
+            returnType = inferExpression(ctx->expression(), tyAUTO);
+        }
+        updateFunctionReturn(curFuncName, returnType, ctx->getStart()->getLine());
+        return nullptr;
+    }
+
+    any visitIfstmt(BParser::IfstmtContext *ctx) override {
+        Types condType = inferExpr(ctx->expr(), tyBOOL);
+        if (isKnown(condType) && condType != tyBOOL) {
+            print_error_and_exit(ctx->getStart()->getLine(), "if condition must be bool");
+        }
+        visit(ctx->statement(0));
+        if (ctx->ELSE()) {
+            visit(ctx->statement(1));
+        }
+        return nullptr;
+    }
+
+    any visitWhilestmt(BParser::WhilestmtContext *ctx) override {
+        Types condType = inferExpr(ctx->expr(), tyBOOL);
+        if (isKnown(condType) && condType != tyBOOL) {
+            print_error_and_exit(ctx->getStart()->getLine(), "while condition must be bool");
+        }
+        visit(ctx->statement());
+        return nullptr;
+    }
 };
 
 /*
  * STEP 3. print code
  */
 class PrintTreeVisitor : public BBaseVisitor {
+private:
+    string curScope;
+    string curFunctionName;
+
+    string typeName(Types type) {
+        return mnemonicTypes[type];
+    }
+
+    string functionReturnType(const string& functionName, Types type) {
+        if (functionName == "main" && type == tyVOID) {
+            return "int";
+        }
+        return typeName(type);
+    }
+
+    SymbolAttributes symbolInCurrentScope(const string& name, int line) {
+        auto it = symTabs.find(curScope);
+        if (it == symTabs.end() || !it->second->symbolExists(name)) {
+            print_error_and_exit(line, "internal error: missing symbol " + name);
+        }
+        return it->second->getSymbolAttributes(name);
+    }
+
+    Types visibleSymbolType(const string& name, int line) {
+        string foundScope;
+        SymbolAttributes attr;
+        if (!lookupSymbol(curScope, name, foundScope, attr)) {
+            print_error_and_exit(line, "internal error: missing symbol " + name);
+        }
+        return attr.type;
+    }
+
 public:
     any visitProgram(BParser::ProgramContext *ctx) override {
-    	// Perform some actions when visiting the program
-    	for (int i=0; i< ctx->children.size(); i++) {
-      	    visit(ctx->children[i]);
-    	}
-    	return nullptr;
+        blockCounters.clear();
+        curScope = _GlobalFuncName_;
+        curFunctionName = "";
+        for (auto child : ctx->children) {
+            visit(child);
+        }
+        return nullptr;
     }
-    
+
     any visitDirective(BParser::DirectiveContext *ctx) override {
-		cout << ctx->SHARP_DIRECTIVE()->getText();
-		cout << endl;
+        cout << ctx->SHARP_DIRECTIVE()->getText() << endl;
         return nullptr;
     }
 
     any visitDefinition(BParser::DefinitionContext *ctx) override {
-		visit(ctx->children[0]);
+        visit(ctx->children[0]);
         return nullptr;
     }
 
     any visitFuncdef(BParser::FuncdefContext *ctx) override {
-		// Handle function definition
         string functionName = ctx->name(0)->getText();
-		cout << "auto " << functionName << "(" ;
-        // You can retrieve and visit the parameter list using ctx->name(i)
-		for (int i=1; i < ctx->name().size(); i++) {
-			if (i != 1) cout << ", ";
-			cout << "auto " << ctx->name(i)->getText();		
-		}
-		cout << ")";
+        SymbolAttributes funcAttr;
+        getGlobalFunction(functionName, funcAttr);
 
-		// visit blockstmt
-		visit(ctx->blockstmt());
+        cout << functionReturnType(functionName, funcAttr.retArgTypes[0]) << " " << functionName << "(";
+        for (int i = 1; i < static_cast<int>(ctx->name().size()); i++) {
+            if (i != 1) cout << ", ";
+            cout << typeName(funcAttr.retArgTypes[i]) << " " << ctx->name(i)->getText();
+        }
+        cout << ")";
+
+        string prevScope = curScope;
+        string prevFunctionName = curFunctionName;
+        curScope = functionName;
+        curFunctionName = functionName;
+        cout << " ";
+        cout << "{" << endl;
+        for (auto stmt : ctx->blockstmt()->statement()) {
+            visit(stmt);
+        }
+        cout << "}" << endl;
+        curScope = prevScope;
+        curFunctionName = prevFunctionName;
         return nullptr;
     }
 
     any visitStatement(BParser::StatementContext *ctx) override {
-		visit(ctx->children[0]);
+        visit(ctx->children[0]);
         return nullptr;
     }
 
     any visitAutostmt(BParser::AutostmtContext *ctx) override {
-    	// You can retrieve the variable names and constants using ctx->name(i) and ctx->constant(i)
-		cout << "auto ";
-		for (int i=0, j=0; i < ctx->name().size(); i++) {
-			if (i != 0) cout << " ,";
-			cout << ctx->name(i)->getText();
+        for (int i = 0; i < static_cast<int>(ctx->name().size()); i++) {
+            string varName = ctx->name(i)->getText();
+            SymbolAttributes attr = symbolInCurrentScope(varName, ctx->name(i)->getStart()->getLine());
 
-			int idx_assn = 1 + i*2 + j*2 + 1;  // auto name (= const)?, name (= const)?, ...
-			if (ctx->children[idx_assn]->getText().compare("=") == 0) { 
-				if (ctx->constant(j)) {
-					cout << " = ";    
-					visit(ctx->constant(j));
-					j++;
-				}
-			}
-		}
-		cout << ";" << endl;
-    	return nullptr;
+            cout << typeName(attr.type) << " " << varName;
+            if (autostmtHasInitializer(ctx, i)) {
+                cout << " = ";
+                visit(ctx->constant(initializerIndexForName(ctx, i)));
+            }
+            cout << ";" << endl;
+        }
+        return nullptr;
     }
 
     any visitDeclstmt(BParser::DeclstmtContext *ctx) override {
-		// Handle function declaration
         string functionName = ctx->name()->getText();
-		cout << "auto " << functionName << "(" ;
-        
-		// You can retrieve and visit the parameter type list
-		for (int i=1; i < ctx->AUTO().size(); i++) {
-			if (i != 1) cout << ", ";
-			cout << "auto ";		
-		}
-		cout << ");" << endl;
+        SymbolAttributes funcAttr;
+        getGlobalFunction(functionName, funcAttr);
+
+        cout << typeName(funcAttr.retArgTypes[0]) << " " << functionName << "(";
+        for (int i = 1; i < static_cast<int>(funcAttr.retArgTypes.size()); i++) {
+            if (i != 1) cout << ", ";
+            cout << typeName(funcAttr.retArgTypes[i]);
+        }
+        cout << ");" << endl;
         return nullptr;
     }
 
     any visitBlockstmt(BParser::BlockstmtContext *ctx) override {
-    	// Perform some actions when visiting a block statement
-		cout << "{" << endl;
-    	for (auto stmt : ctx->statement()) {
-      	    visit(stmt);
-    	}
-		cout << "}" << endl;
-    	return nullptr;
+        string blockScope = nextBlockScope(curScope);
+        string prevScope = curScope;
+        curScope = blockScope;
+
+        cout << "{" << endl;
+        for (auto stmt : ctx->statement()) {
+            visit(stmt);
+        }
+        cout << "}" << endl;
+
+        curScope = prevScope;
+        return nullptr;
     }
 
     any visitIfstmt(BParser::IfstmtContext *ctx) override {
-		cout << "if (";
-		visit(ctx->expr());
-		cout << ") " ;
-
-		visit(ctx->statement(0));
-		if (ctx->ELSE()) {
-	   		cout << endl << "else ";
-	   		visit(ctx->statement(1));
-		}
+        cout << "if (";
+        visit(ctx->expr());
+        cout << ") ";
+        visit(ctx->statement(0));
+        if (ctx->ELSE()) {
+            cout << "else ";
+            visit(ctx->statement(1));
+        }
         return nullptr;
     }
 
@@ -441,96 +852,102 @@ public:
     }
 
     any visitExpressionstmt(BParser::ExpressionstmtContext *ctx) override {
-		visit(ctx->expression());
-		cout << ";" << endl;
+        visit(ctx->expression());
+        cout << ";" << endl;
         return nullptr;
     }
 
     any visitReturnstmt(BParser::ReturnstmtContext *ctx) override {
-		cout << "return";
-		if (ctx->expression()) {
-			cout << " (";
-			visit(ctx->expression());
-			cout << ")";
-		}
-		cout << ";" << endl;
+        cout << "return";
+        if (ctx->expression()) {
+            cout << " ";
+            SymbolAttributes funcAttr;
+            if (!curFunctionName.empty() && getGlobalFunction(curFunctionName, funcAttr)
+                && funcAttr.retArgTypes[0] == tyCHAR) {
+                cout << "(char)(";
+                visit(ctx->expression());
+                cout << ")";
+            } else {
+                visit(ctx->expression());
+            }
+        }
+        cout << ";" << endl;
         return nullptr;
     }
 
     any visitNullstmt(BParser::NullstmtContext *ctx) override {
-		cout << ";" << endl;
+        cout << ";" << endl;
         return nullptr;
     }
 
     any visitExpr(BParser::ExprContext *ctx) override {
-		// unary operator
-        if(ctx->atom()) {
+        if (ctx->atom()) {
             if (ctx->PLUS()) cout << "+";
             else if (ctx->MINUS()) cout << "-";
-	    	else if (ctx->NOT()) cout << "!";
-	    	visit(ctx->atom()); 
+            else if (ctx->NOT()) cout << "!";
+            visit(ctx->atom());
+        } else if (ctx->MUL() || ctx->DIV() || ctx->PLUS() || ctx->MINUS() ||
+                   ctx->GT() || ctx->GTE() || ctx->LT() || ctx->LTE() ||
+                   ctx->EQ() || ctx->NEQ() || ctx->AND() || ctx->OR()) {
+            visit(ctx->expr(0));
+            cout << " " << ctx->children[1]->getText() << " ";
+            visit(ctx->expr(1));
+        } else if (ctx->QUEST()) {
+            visit(ctx->expr(0));
+            cout << " ? ";
+            visit(ctx->expr(1));
+            cout << " : ";
+            visit(ctx->expr(2));
+        } else {
+            print_error_and_exit(ctx->getStart()->getLine(), "unrecognized expression");
         }
-		// binary operator
-		else if (ctx->MUL() || ctx->DIV() || ctx->PLUS() || ctx->MINUS() || 
-		 		ctx->GT() || ctx->GTE() || ctx->LT() || ctx->LTE() || ctx->EQ() || ctx->NEQ() ||
-		 		ctx->AND() || ctx->OR() ) {
-	    	visit(ctx->expr(0));
-	    	cout << " " << ctx->children[1]->getText() << " "; // print binary operator
-	    	visit(ctx->expr(1));
-		}
-		// ternary operator
-		else if (ctx->QUEST()) {
-			visit(ctx->expr(0));
-			cout << " ? ";
-			visit(ctx->expr(1));
-			cout << " : ";
-			visit(ctx->expr(2));
-		}
-		else {
-			int lineNum = ctx->getStart()->getLine();
-			cerr << endl << "[ERROR] visitExpr: unrecognized ops in Line " << lineNum << " --" << ctx->children[1]->getText() << endl;
-			exit(-1); // error
-        }	
         return nullptr;
     }
-   
+
     any visitAtom(BParser::AtomContext *ctx) override {
-		if (ctx->expression()) { // ( expression )
-			cout << "(";
-			visit(ctx->expression());
-			cout << ")";
-		}
-		else	// name | constant | funcinvocation
-			visit(ctx->children[0]);
+        if (ctx->expression()) {
+            cout << "(";
+            visit(ctx->expression());
+            cout << ")";
+        } else {
+            visit(ctx->children[0]);
+        }
         return nullptr;
     }
-    
+
     any visitExpression(BParser::ExpressionContext *ctx) override {
-        if (ctx->ASSN()) { // assignment
-	   		visit(ctx->name());
-	  		 cout << " = ";
-		}
-		visit(ctx->expr());
+        if (ctx->ASSN()) {
+            Types lhsType = visibleSymbolType(ctx->name()->getText(), ctx->name()->getStart()->getLine());
+            visit(ctx->name());
+            cout << " = ";
+            if (lhsType == tyCHAR) {
+                cout << "(char)(";
+                visit(ctx->expr());
+                cout << ")";
+                return nullptr;
+            }
+        }
+        visit(ctx->expr());
         return nullptr;
     }
 
     any visitFuncinvocation(BParser::FuncinvocationContext *ctx) override {
-		cout << ctx->name()->getText() << "(";
-		for (int i=0; i < ctx->expr().size(); i++) {
-			if (i != 0) cout << ", ";
-			visit(ctx->expr(i));
-		}
-		cout << ")";
+        cout << ctx->name()->getText() << "(";
+        for (int i = 0; i < static_cast<int>(ctx->expr().size()); i++) {
+            if (i != 0) cout << ", ";
+            visit(ctx->expr(i));
+        }
+        cout << ")";
         return nullptr;
     }
-    
+
     any visitConstant(BParser::ConstantContext *ctx) override {
         cout << ctx->children[0]->getText();
         return nullptr;
     }
-    
+
     any visitName(BParser::NameContext *ctx) override {
-		cout << ctx->NAME()->getText();
+        cout << ctx->NAME()->getText();
         return nullptr;
     }
 };
@@ -540,37 +957,40 @@ int main(int argc, const char* argv[]) {
         cerr << "[Usage] " << argv[0] << "  <input-file>\n";
         exit(0);
     }
-    std::ifstream stream;
+
+    ifstream stream;
     stream.open(argv[1]);
     if (stream.fail()) {
         cerr << argv[1] << " : file open fail\n";
         exit(0);
     }
 
-	//cout << "/*-- B2C ANTLR visitor --*/\n";
+    ANTLRInputStream inputStream(stream);
+    BLexer lexer(&inputStream);
+    CommonTokenStream tokenStream(&lexer);
+    BParser parser(&tokenStream);
+    ParseTree* tree = parser.program();
 
-	ANTLRInputStream inputStream(stream);
-	BLexer lexer(&inputStream);
-	CommonTokenStream tokenStream(&lexer);
-	BParser parser(&tokenStream);
-	ParseTree* tree = parser.program();
+    if (parser.getNumberOfSyntaxErrors() > 0) {
+        exit(-1);
+    }
 
-	// STEP 1. visit parse tree and build symbol tables for functions (PA#1)
-	cout << endl << "/*** STEP 1. BUILD SYM_TABS *************" << endl;
-	SymbolTableVisitor SymtabTree;
-	SymtabTree.visit(tree);
-	cout <<         " ***    end of step 1       *************/" << endl;
+    SymbolTableVisitor SymtabTree;
+    SymtabTree.visit(tree);
 
-	// STEP 2. visit parse tree and perform type inference for 'auto' typed variables and functions (PA#2)
-	cout << endl << "/*** STEP 2. ANALYZE TYPES  *************" << endl;
-	TypeAnalysisVisitor AnalyzeTree;
-	AnalyzeTree.visit(tree);
-	cout <<         " ***    end of step 2       *************/" << endl;
+    for (int i = 0; i < 20; i++) {
+        TypeAnalysisVisitor AnalyzeTree;
+        AnalyzeTree.visit(tree);
+        if (!AnalyzeTree.didChange()) {
+            break;
+        }
+    }
 
-	// STEP 3. visit parse tree and print out C code with correct types
-	cout << endl << "/*** STEP 3. TRANSFORM to C *************/" << endl;
-	PrintTreeVisitor PrintTree;
-	PrintTree.visit(tree);
+    TypeAnalysisVisitor FinalCheck;
+    FinalCheck.finalize();
 
-	return 0;
+    PrintTreeVisitor PrintTree;
+    PrintTree.visit(tree);
+
+    return 0;
 }

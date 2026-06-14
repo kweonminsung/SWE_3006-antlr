@@ -7,8 +7,9 @@ ANTLR4_RUNTIME=/usr/local/include/antlr4-runtime
 CFLAGS=-I. -I$(ANTLR4_RUNTIME)
 LIBS=-lantlr4-runtime
 
-INPUT_B=input.b
-OUTPUT_C=output.c
+INPUT_B?=INPUTS/input3.b
+OUTPUT_C?=output.c
+INDENT?=cat
 WFLAGS=-Wconversion -Wall -pedantic
 
 
@@ -27,8 +28,8 @@ antlr: $(G4)
 	$(ANTLR4) $<
 
 run: antlr $(PROG)
-	./$(PROG) $(INPUT_B) | indent > $(OUTPUT_C)
-	$(CXX) $(WFLAGS) $(OUTPUT_C)
+	./$(PROG) $(INPUT_B) | $(INDENT) > $(OUTPUT_C)
+	$(CXX) $(WFLAGS) -IINPUTS $(OUTPUT_C)
 
 .PHONY: clean
 

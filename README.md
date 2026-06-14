@@ -1,313 +1,173 @@
-# ANTLR 4 Tutorial & PA#1
+# PA #2 - B2C Translator: Type Inference
 
-## Introduction
+This project extends the PA #1 B-to-C translator by adding type inference for the B language. The translator reads B source code, infers every `auto` type, updates the symbol table during parse-tree traversal, and prints correctly typed C/C++-compilable code to `stdout`.
 
-- ANTLL (Another Tool for Language Recognition)
-- A powerful parser generator
-- Parser for reading, processing, executing, or translating structured text or binary files
-- Widely used to build languages, tools, and frameworks
+The original assignment material is preserved at the end of this README as rendered slide captures so that both the textual and visual contents of the PDF are included.
 
-### ANTLR
-- Input: a grammar file (e.g., `Hello.g4`)
-- Output: parser code in Java (e.g., `Hello*.java`)
+## 1. Assignment Overview
 
----
+- Assignment: **PA #2 - B2C Translator**
+- Source language: **B**, a C-like language defined in `B.g4`
+- Implementation style: **ANTLR visitor pattern**
+- Translator type: **B source code to C/C++ source code**
+- Main goal: infer all implicitly typed `auto` variables, function parameters, and function return types
+- Required output: C/C++ source code with `auto` replaced by concrete types
+- Error policy: stop at the first type error, print the error, and exit
 
-## Parse Tree
+## 2. Supported Types
 
-- ANTLR-generated parser builds a data structure
-- Parse tree (or syntax tree)
-- “organization of input” according to grammar
+B source code writes all user-defined types as `auto`, but the translator must infer one of the following actual types:
 
----
+| Type | Meaning |
+| --- | --- |
+| `int` | integer value |
+| `double` | floating-point value |
+| `char` | character value |
+| `string` | string value |
+| `bool` | boolean value |
+| `void` | function return type only |
 
-## Example Grammar File (`*.g4`)
+`void` is only valid as a function return type. It must not be assigned as a variable type.
 
-```antlr
-/* Example grammar for Expr.g4 */
-grammar Expr; // name of grammar
+## 3. Core Type System Rule
 
-// parser rules – start with lowercase letters
-prog: (expr NEWLINE)* ;
+The B language is strongly typed.
 
-expr
-    : expr ('*'|'/') expr
-    | expr ('+'|'-') expr
-    | INT
-    | '(' expr ')'
-    ;
+There are no compatible or implicitly convertible types. Operations are valid only when the relevant operands have exactly the same inferred type. For example, an `int` expression and a `double` expression must not be treated as compatible.
 
-// lexer rules – start with uppercase letters
-NEWLINE : [\r\n]+ ;
-INT : [0-9]+ ;
-WS : [ \t\r\n]+ -> skip ;
-```
+Whenever operations among different types occur, the translator must call `print_error_and_exit`.
 
----
+## 4. Type Inference Rules
 
-## Lexer: Regular Expressions
+### 4.1 Variable Type Inference
 
-- `.` matches any single character
-- `*` matches zero or more copies of preceding expression
-- `+` matches one or more copies of preceding expression
-- `?` matches zero or one copy of preceding expression
-- `-?[0-9]+` : signed numbers including optional minus sign
-- `[ ]` matches any character within the brackets
-- `[Abc1]`, `[A-Z]`, `[A-Za-z]`, `[^0-9]`
-- `^` matches the beginning of line
-- `$` matches the end of line
-- `\` escapes a metacharacter, e.g. `\*` matches `*`
-- `|` matches either the preceding expression or the following
-- `abc|ABC`, `(abc)|(ABC)`, `[abc]|[ABC]`
-- `( )` groups a series of regular expressions
-- `(123)(123)*`
+A variable declared with `auto` receives its type from its first assignment or initializer.
 
-Any non-digit, i.e., any except `0-9`
-
----
-
-## Parser: Subrules
-
-- `(x|y|z)` : match any alternative within the subrule exactly
-  - `returnType: (type | 'void') ;`
-
-- `(x|y|z)?` : match nothing or any alternative within subrule
-  - `classDecl: 'class' ID (typeParameters)? ;`
-
-- `(x|y|z)*` : match an alternative within subrule zero or more times
-  - `annotationName: ID ('.' ID)* ;`
-
-- `(x|y|z)+` : match an alternative within subrule one or more times
-  - `annotations: (annotation)+ ;`
-
----
-
-## Running ANTLR Parser Generator (C++ ver.)
-
-- Writing a grammar file
-  - e.g., `Expr.g4`
-- Process with ANTLR for C++
-
-```bash
-$ antlr4 -Dlanguage=Cpp Expr.g4
-$ ls *.cpp *.h
-ExprBaseListener.cpp  ExprBaseListener.h
-ExprListener.cpp      ExprListener.h
-ExprLexer.cpp         ExprLexer.h
-ExprParser.cpp        ExprParser.h
-```
-
-- Now we are ready to write main program
-
----
-
-## Running ANTLR Parser Generator (Java ver.)
-
-- Writing a grammar file
-  - e.g., `Expr.g4`
-- Process with ANTLR
-
-```bash
-$ antlr4 Expr.g4
-```
-
-- Compile Java programs
-
-```bash
-$ javac Expr*.java
-```
-
-- Run a generated parse
-
-```bash
-$ grun Expr prog -gui
-$ grun Expr prog -tree
-```
-
-Example:
-
-```bash
-$ antlr4 Expr.g4
-$ javac Expr*.java
-$ grun Expr prog -gui
-100 + 2*34
-^D
-(prog (expr (expr 100) + (expr (expr 2) * (expr 34))) \n)
-```
-
----
-
-## Parse Tree Manipulation
-
-- Now, you have a parse tree.
-- Walk a parse tree with ANTLR tools – Listener or Visitor
-
-### Listener
-- Walk all parse tree with DFS from the first root node
-- Make functions triggered at entering/exit of nodes
-- e.g., `ExprBaseListener.cpp/h` is generated from `antlr4`
-
-### Visitor
-- Make functions triggered at entering/exit of nodes
-- Unlike listener, user explicitly calls visitor on child nodes
-- To generate visitor class, use `-visitor` option for `antlr4`
-
-```bash
-$ antlr4 -Dlanguage=Cpp -no-listener -visitor -o antlr4-cpp B.g4
-```
-
----
-
-## `B.g4`: Parser/Lexer Rules for B Lang.
-
-```antlr
-/* B.g4 */
-grammar B;
-
-// parser rules
-program
-    : ( directive | definition )* EOF
-    ;
-
-directive
-    : SHARP_DIRECTIVE
-    ;
-
-definition
-    : autostmt
-    | declstmt
-    | funcdef
-    ;
-
-autostmt
-    : AUTO name (ASSN constant)? (',' name (ASSN constant)?)* SEMI
-    ;
-
-declstmt
-    : AUTO name '(' (AUTO (',' AUTO )*)? ')' SEMI
-    ;
-
-funcdef
-    : AUTO name '(' (AUTO name (',' AUTO name)*)? ')' blockstmt
-    ;
-
-blockstmt
-    : '{' statement* '}'
-    ;
-
-statement
-    : autostmt
-    | declstmt
-    | blockstmt
-    | ifstmt
-    | whilestmt
-    | expressionstmt
-    | returnstmt
-    | nullstmt
-    | directive
-    ;
-
-ifstmt
-    : IF '(' expr ')' statement (ELSE statement)?
-    ;
-
-whilestmt
-    : WHILE '(' expr ')' statement
-    ;
-
+```b
+auto x;
 ...
-
-// lexer rules
-AUTO   : 'auto' ;
-SEMI   : ';' ;
-...
-IF     : 'if' ;
-ELSE   : 'else' ;
-WHILE  : 'while' ;
-RETURN : 'return' ;
-ASSN   : '=' ;
-WS     : [ \t\r\n]+ -> skip ;
+x = alpha;
 ```
 
----
+Inference rule:
 
-## `BBaseVisitor.cpp/h`
+```text
+type(x) := inferred_type(alpha)
+```
 
-```cpp
-// Generated from B.g4 by ANTLR 4.13.1
-#pragma once
-#include "antlr4-runtime.h"
-#include "BVisitor.h"
+If the variable is initialized at declaration time, the initializer acts as the first assignment.
 
-class BBaseVisitor : public BVisitor {
-public:
-    virtual std::any visitProgram(BParser::ProgramContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitDirective(BParser::DirectiveContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitDefinition(BParser::DefinitionContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitAutostmt(BParser::AutostmtContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitDeclstmt(BParser::DeclstmtContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitFuncdef(BParser::FuncdefContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitBlockstmt(BParser::BlockstmtContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitStatement(BParser::StatementContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitIfstmt(BParser::IfstmtContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitWhilestmt(BParser::WhilestmtContext *ctx) override { return visitChildren(ctx); }
+```b
+auto a = 1;      // a: int
+auto f = 1.0;    // f: double
+```
+
+After the type is fixed, every later assignment to the same variable must use the same type.
+
+### 4.2 Function Return Type Inference
+
+A function declared with `auto` receives its return type from its `return` statement.
+
+```b
+auto func(auto x, auto y) {
     ...
-    virtual std::any visitExpression(BParser::ExpressionContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitFuncinvocation(BParser::FuncinvocationContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitConstant(BParser::ConstantContext *ctx) override { return visitChildren(ctx); }
-    virtual std::any visitName(BParser::NameContext *ctx) override { return visitChildren(ctx); }
-};
+    return gamma;
+}
 ```
 
-`BBaseVisitor.cpp/h` is generated by ANTLR4 along with multiple `.cpp/.h` files and others.
+Inference rule:
 
-You can find them in `antlr4-cpp/*`.
-
-```bash
-$ java -jar /usr/local/lib/antlr-complete.jar -Dlanguage=Cpp -no-listener -visitor -o antlr4-cpp B.g4
-$ make antlr
-$ ls antlr4-cpp/*
+```text
+return_type(func) := inferred_type(gamma)
 ```
 
----
+If the function body has no `return` statement, the function return type is `void`.
 
-## Skeleton Code
+```b
+auto func() {
+    // no return statement
+}
+```
 
-### Files in skeleton code
-- `B2CMain.cpp`
-- `B.g4`
-- `Makefile`
-- `INPUTS/input*.b`
+Inference result:
 
-```cpp
-/* B2CMain.cpp */
-...
-class SymbolTableVisitor : public BBaseVisitor {
-    // build symbol tables for functions and globals
-    // ...
-};
+```text
+return_type(func) == void
+```
 
-class TypeAnalysisVisitor : public BBaseVisitor {
-    // infer types for 'auto' variables and functions
-    // ...
-};
+A bare `return;` is also a `void` return. Mixing a value-returning statement and a bare `return;` in the same function is a return type mismatch.
 
-class PrintTreeVisitor : public BBaseVisitor {
-    // skeleton code will print out for B language
-    // you need to change them to print out right type
-    // ...
+### 4.3 Function Parameter Type Inference
+
+Function parameter types are determined by the first call site.
+
+```b
+auto func(auto x, auto y) {
+    ...
 }
 
-/* B2CMain.cpp – continued */
+A() {
+    ...
+    func(alpha, beta);
+    ...
+}
+```
+
+Inference rules:
+
+```text
+type(x) := inferred_type(alpha)
+type(y) := inferred_type(beta)
+```
+
+After the parameter types are fixed, every later call to the same function must pass arguments with the same types and the same number of parameters.
+
+## 5. Required Symbol Table Behavior
+
+The translator must build and update symbol tables while traversing the parse tree.
+
+### STEP 1 - Build Symbol Tables
+
+`SymbolTableVisitor` builds symbol tables for global variables and functions.
+
+```cpp
+class SymbolTableVisitor : public BBaseVisitor {
+    // build symbol tables for functions and globals
+};
+```
+
+### STEP 2 - Infer Types
+
+`TypeAnalysisVisitor` infers all `auto` types and updates the symbol table.
+
+```cpp
+class TypeAnalysisVisitor : public BBaseVisitor {
+    // infer types for auto variables and functions
+};
+```
+
+### STEP 3 - Print Typed Code
+
+`PrintTreeVisitor` must print C/C++ code with the correct inferred types instead of `auto`.
+
+```cpp
+class PrintTreeVisitor : public BBaseVisitor {
+    // print typed C/C++ code
+};
+```
+
+The main flow is:
+
+```cpp
 int main(int argc, const char* argv[]) {
-    // ANTLR parsing ...
+    // ANTLR parsing
     ParseTree* tree = parser.program();
 
     // STEP 1. build symbol table
     SymbolTableVisitor SymtabTree;
     SymtabTree.visit(tree);
 
-    // STEP 2. infer types for 'auto' vars/fns
+    // STEP 2. infer types for auto vars/fns
     TypeAnalysisVisitor AnalyzeTree;
     AnalyzeTree.visit(tree);
 
@@ -319,262 +179,357 @@ int main(int argc, const char* argv[]) {
 }
 ```
 
----
+## 6. Type Error Cases
 
-## `B2CMain.cpp` --- symbol table
+The translator must detect the following type errors. On the first type error, it must print an error message and exit.
 
-```cpp
-#include <iostream>
-#include "ExprBaseListener.h"
-#include "ExprLexer.h"
-#include "ExprParser.h"
+### 6.1 Different Types for the Same Variable
 
-using namespace std;
-using namespace antlr4;
-using namespace antlr4::tree;
-
-enum Types { tyAUTO, tyINT, tyDOUBLE, tySTRING, tyBOOL, tyCHAR, tyFUNCTION };
-string mnemonicTypes[] = { "auto", "int", "double", "string", "bool", "char", "function" };
-
-struct SymbolAttributes {
-    Types type; // int, double, bool, char, string, function --- auto if unknown yet
-
-    // if type == "function"
-    vector<Types> retArgTypes; // first element is a return_type
-};
-
-class SymbolTable {
-private:
-    map<string, SymbolAttributes> table; // symbol-name: string, symbol-typeInfo: SymbolAttributes
-
-public:
-    // Add a new symbol
-    void addSymbol(const string& name, const SymbolAttributes& attributes) {
-        table[name] = attributes;
-    }
-
-    ...
-
-    // Print all symbols in the table (for debugging purposes)
-    void printSymbols() const {
-        for (const auto& pair : table) {
-            cout << "(name) " << pair.first << ", (type) " << mnemonicTypes[pair.second.type];
-            ...
-        }
-    }
-};
+```b
+auto x;
+...
+x = alpha;
+...
+x = beta;
 ```
+
+If `x` was first inferred from `alpha`, a later assignment from `beta` is valid only when both inferred types are the same.
+
+```text
+type(x) := inferred_type(alpha)
+type(x) != inferred_type(beta) => type mismatch error
+```
+
+### 6.2 Different Parameter Types for the Same Function
+
+```b
+auto func(auto x, auto y) {
+    ...
+}
+
+A() {
+    func(alpha1, beta1);
+    ...
+    func(alpha2, beta2);
+}
+```
+
+Errors occur when later call sites do not match the parameter types inferred from the first call site.
+
+```text
+inferred_type(alpha1) != inferred_type(alpha2) => parameter type error
+inferred_type(beta1)  != inferred_type(beta2)  => parameter type error
+```
+
+### 6.3 Different Number of Parameters
+
+Every call to the same function must use the same number of parameters as the function declaration and the other call sites.
+
+```b
+auto func(auto, auto);
+
+A() {
+    func(alpha, beta, gamma);  // error: too many arguments
+    func(alpha, beta);         // valid only if declaration has two parameters
+    func(alpha);               // error: too few arguments
+}
+```
+
+Error rule:
+
+```text
+num_of_params(func) != num_of_params(func_call_siteN) => parameter count error
+```
+
+### 6.4 Function Return Type Mismatch
+
+All return statements in the same function must resolve to the same type.
+
+```b
+auto func() {
+    if (...) return alpha;
+    else if (...) return beta;
+    else return;
+}
+```
+
+Errors occur when return expressions have different types, or when a value-returning statement is mixed with a `void` return.
+
+```text
+inferred_type(alpha) != inferred_type(beta) => return type error
+inferred_type(func_return) != void when mixed with return; => return type error
+```
+
+### 6.5 Function Return Used in an Incompatible Context
+
+A function call expression has the function's inferred return type. Assignment from a function call must match the destination variable type.
+
+```b
+A() {
+    auto a = 1;      // a: int
+    a = func(alpha); // valid only if func(alpha) returns int
+}
+```
+
+Error rule:
+
+```text
+inferred_type(a) != inferred_type(func(alpha)) => type mismatch error
+```
+
+### 6.6 Undefined Variables
+
+An `auto` variable whose type is never inferred is an undefined type error.
+
+```b
+auto x, y, z;
+...
+x = alpha;
+...
+z = beta;
+```
+
+Inference results:
+
+```text
+type(x) := inferred_type(alpha)
+type(y) := UNDEFINED => error
+type(z) := inferred_type(beta)
+```
+
+### 6.7 Undefined Functions
+
+A function type is undefined if the translator cannot infer its return type or parameter types.
+
+```b
+auto func(auto x, auto y);
+// no definition of func(...)
+
+A() {
+    // no call site of func(alpha, beta)
+}
+```
+
+Errors:
+
+```text
+inferred_type(func_return) == UNDEFINED => error
+inferred_type(x) == UNDEFINED => error
+inferred_type(y) == UNDEFINED => error
+```
+
+## 7. `#define` and `#include` Handling
+
+The translator does not need to analyze macros or header files.
+
+Rules:
+
+- Do not look into header files.
+- Do not analyze macro definitions.
+- Do not register macro functions in the symbol table.
+- Treat macro functions as externally defined functions.
+- Assume macro functions return the appropriate type required by the context.
 
 Example:
 
-```cpp
-( a, { tyAUTO } )
-( b, { tyAUTO } )
-(main, { tyFUNCTION, [auto] })
-symTabs[$_global_$]
-
-( i, { tyAUTO } )
-( j, { tyAUTO } )
-( phi, { tyAUTO } )
-symTabs[main]
-```
-
 ```c
-/* input.b */
-auto a, b = 10;
-auto main() {
-    auto i, j, phi = 3.14;
-    ...
-}
+#include <stdio.h>
+#include "myheader.h"
+
+#define fn(x) arr[x]
 ```
 
----
+B code:
 
-## `B2CMain.cpp` --- building symbol tables
-
-```cpp
-const string _GlobalFuncName_ = "$_global_$";
-
-// collection of per-function symbol tables accessed by function name
-// symbol table in global scope can be accessed with special name defined in _GlobalFuncName_
-map<string, SymbolTable*> symTabs;
-
-class SymbolTableVisitor : public BBaseVisitor {
-private:
-    int scopeLevel;
-    string curFuncName;
-
-public:
-    // Building symbol tables by visiting tree
-    any visitProgram(BParser::ProgramContext *ctx) override {
-        scopeLevel = 0; // global scope
-
-        // prepare symbol table for global scope
-        SymbolTable* globalSymTab = new SymbolTable();
-        curFuncName = _GlobalFuncName_;
-        symTabs[curFuncName] = globalSymTab;
-
-        // visit children
-        for (int i = 0; i < ctx->children.size(); i++) {
-            visit(ctx->children[i]);
-        }
-
-        // print all symbol tables
-        for (auto& pair : symTabs) {
-            cout << "--- Symbol Table --- " << pair.first << endl; // function name
-            pair.second->printSymbols(); // per-function symbol table
-            cout << "";
-        }
-
-        return nullptr;
-    }
-    ...
-};
+```b
+auto x = 1;
+auto y = x + fn(x);
+...
+auto f = 1.0;
+auto g = f + fn(f);
 ```
 
-```c
-/* input.b */
-auto a, b = 10;
-auto main() {
-    auto i, j, phi = 3.14;
-    ...
-}
+Expected inference:
+
+```text
+x: int
+fn(x): int in the expression x + fn(x)
+y: int
+
+f: double
+fn(f): double in the expression f + fn(f)
+g: double
 ```
+
+The same macro-like function can therefore be treated as returning different appropriate types in different contexts, because it is not registered or checked as a normal B function.
+
+## 8. Build, Run, and Validation
+
+The program must accept an input file from the command line and print translated code to `stdout`.
 
 ```bash
-$ make
-$ ./b2c input.b
---- Symbol Table --- $_global_$
-(name) a, (type) auto
-(name) b, (type) int
-(name) main, (type) function | auto ()
---- Symbol Table --- main
-(name) i, (type) auto
-(name) j, (type) auto
-(name) phi, (type) double
-$
+./b2c input.b | indent > output.c
 ```
+
+The generated output must compile without type-related warnings or errors.
 
 ```bash
-$ sudo apt install indent
-$ ./b2c input.b | indent
+g++ -Wconversion -Wall -pedantic output.c
 ```
 
-(show source code with indentation)
-
----
-
-## Building symbol table with scope
-
-```c
-/* input0.b */
-auto a, b = 10;
-auto fn(auto, auto);
-
-auto main() {
-    auto i, j, phi = 3.14;
-    auto a;
-    {
-        auto x;
-    }
-    while (true) {
-        auto y;
-        if (y) {
-            auto z;
-        } else {
-        }
-    }
-}
-
-auto fn(auto x, auto y) {
-}
-```
+The provided `Makefile` may run a similar sequence:
 
 ```bash
-$ ./b2c input0.b
---- Symbol Table --- $_global_$
-(name) a, (type) auto
-(name) b, (type) int
-(name) fn, (type) function | auto (auto, auto)
-(name) main, (type) function | auto ()
---- Symbol Table --- main
-(name) i, (type) auto
-(name) j, (type) auto
-(name) phi, (type) double
-(name) a, (type) auto
---- Symbol Table --- main_$1
-(name) x, (type) auto
---- Symbol Table --- main_$2
-(name) y, (type) auto
---- Symbol Table --- main_$2_1
-(name) z, (type) auto
---- Symbol Table --- main_$2_2
---- Symbol Table --- fn
-(name) x, (type) auto
-(name) y, (type) auto
-$
+make run
+./b2c input.b | indent > output.c
+g++ -Wconversion -Wall -pedantic output.c
 ```
 
----
+## 9. Files Provided in the Skeleton
 
-## Multiple Definition Errors
+The skeleton code includes:
 
-- Multiple declaration of the same name variable
-- Error – if declared at the same depth of scope
-- Insert them into different tables – if declared at different depth of scope
-
-- Multiple definition of the same name functions
-- Error – in principle, it's an error if defined at the same depth of scope
-
-- `inc(auto a), inc(auto a)` → ERROR
-
-### Unsupported
-- Overloaded functions
-- Nested functions
-
-These are **not supported** and **will not be included in test cases**.
-
-- `add(auto a), add(auto a, auto b)` → X (NO Support)
-- `add() { inc(auto a) { ... } ... }` → X (NO Support)
-
-```c
-auto a;
-
-auto main() {
-    auto x;
-    auto a; // OK
-    auto x; // Error
-}
+```text
+B2CMain.cpp
+B.g4
+Makefile
+INPUTS/input*.b
 ```
 
----
+Required work:
 
-## [PA#1] Submission & Grading Policy
+- Complete STEP 2 in `B2CMain.cpp`.
+- Fix STEP 3 in `B2CMain.cpp`.
+- Use the provided `B.g4` grammar.
+- Use the visitor-based structure already provided by the skeleton.
 
-- **[PA #1] Build symbol table**
-- Download `B2C.zip` from iCampus Assignment
-- Complete **STEP 1** of `B2CMain.cpp`
-- Submit `B2CMain.cpp` only — the instructors will use all the other files from `B2C.zip`
-- If you need to modify other files, let them know via Q&A board
-- Discussion is allowed, but plagiarism is not allowed
-- If any code is copied from elsewhere (e.g., friends or internet), you get **0 points**
-- This policy applies equally to all later projects as well
+## 10. Submission Policy
 
----
+Submit only:
 
-## Reference
+```text
+B2CMain.cpp
+```
 
-- *The Definitive ANTLR 4 Reference* - Terence Parr
-- `http://antlr.org` > Dev Tools > Resources
-- Documentation
-  - `https://github.com/antlr/antlr4/blob/master/doc/index.md`
-- Runtime API (look into “Java Runtime” for ANTLR4 APIs)
-  - `http://www.antlr.org/api/`
-- Java util package
-  - `http://www.tutorialspoint.com/java/util/index.htm`
-- Other resource (C++ target)
-  - `https://tomassetti.me/getting-started-antlr-cpp/`
-  - `http://www.cs.sjsu.edu/~mak/tutorials/InstallANTLR4Cpp.pdf`
-- C++ STL tutorials
-  - `https://www.studytonight.com/cpp/stl/`
-  - `https://www.cppreference.com/Cpp_STL_ReferenceManual.pdf`
+The grader will use the other files from `B2C.zip`.
+
+If modifying files other than `B2CMain.cpp` is necessary, ask through the Q&A board before submitting.
+
+## 11. Academic Integrity Policy
+
+Discussion is allowed, but plagiarism is not allowed.
+
+If any code is copied from another person or from the internet, the submission receives 0 points. The policy applies to this project and all following projects.
+
+## 12. Implementation Checklist
+
+Use this checklist before submission.
+
+- [ ] Global variables are registered in the symbol table.
+- [ ] Function declarations and definitions are registered in the symbol table.
+- [ ] Variable types are inferred from first assignment or initializer.
+- [ ] Function return types are inferred from return statements.
+- [ ] Functions with no return statement are inferred as `void`.
+- [ ] Function parameter types are inferred from the first call site.
+- [ ] Later assignments are checked against the already inferred variable type.
+- [ ] Later function calls are checked against the already inferred parameter types.
+- [ ] Function call argument counts are checked.
+- [ ] Return statements in the same function are checked for consistency.
+- [ ] Binary and other typed operations reject operands with different types.
+- [ ] Undefined variable types are reported.
+- [ ] Undefined function return or parameter types are reported.
+- [ ] Macros are not registered as normal functions.
+- [ ] Header files are not analyzed.
+- [ ] `auto` is replaced by concrete types in printed output.
+- [ ] The program exits on the first type error.
+- [ ] Error output includes the source line number and error type.
+- [ ] Generated code compiles with `g++ -Wconversion -Wall -pedantic`.
+
+## 13. Source PDF Coverage Checklist
+
+| PDF page | Covered content |
+| --- | --- |
+| Page 1 | Title slide: Type Inference, PA #2 - B2C translator |
+| Page 2 | Assignment overview, supported types, ANTLR visitor-based B-to-C translator, symbol table update, inference targets, error reporting |
+| Page 3 | Strong typing rule and inference rules for variables, function returns, and function parameters |
+| Page 4 | Inconsistent type errors for variables and function parameters |
+| Page 5 | Function parameter count errors, return type errors, no-return-as-void rule, function return assignment mismatch |
+| Page 6 | Undefined variable and undefined function type errors |
+| Page 7 | `#define` and `#include` handling, macro functions as externally defined/context-typed functions |
+| Page 8 | Skeleton files, visitor classes, and main STEP 1/2/3 traversal flow |
+| Page 9 | PA #2 requirements, stdout behavior, compile command, first-error exit rule |
+| Page 10 | Submission and grading policy, submit only `B2CMain.cpp`, plagiarism warning |
+
+## 14. Original PDF Slide Captures
+
+The following rendered slide images are included so the README preserves the visual information from the PDF as well as the extracted text.
+
+<details>
+<summary>Page 1 - Title</summary>
+
+![Page 1 - Type Inference title slide](readme_assets/pa2-b2c-type-inference/page-01.png)
+
+</details>
+
+<details>
+<summary>Page 2 - Programming Assignment #2</summary>
+
+![Page 2 - Programming Assignment overview](readme_assets/pa2-b2c-type-inference/page-02.png)
+
+</details>
+
+<details>
+<summary>Page 3 - Type Inference</summary>
+
+![Page 3 - Type inference rules](readme_assets/pa2-b2c-type-inference/page-03.png)
+
+</details>
+
+<details>
+<summary>Page 4 - Inconsistent Type Errors</summary>
+
+![Page 4 - Inconsistent variable and parameter types](readme_assets/pa2-b2c-type-inference/page-04.png)
+
+</details>
+
+<details>
+<summary>Page 5 - Inconsistent Type Errors Continued</summary>
+
+![Page 5 - Function parameter count and return type errors](readme_assets/pa2-b2c-type-inference/page-05.png)
+
+</details>
+
+<details>
+<summary>Page 6 - Undefined Types</summary>
+
+![Page 6 - Undefined variables and functions](readme_assets/pa2-b2c-type-inference/page-06.png)
+
+</details>
+
+<details>
+<summary>Page 7 - define and include</summary>
+
+![Page 7 - define and include handling](readme_assets/pa2-b2c-type-inference/page-07.png)
+
+</details>
+
+<details>
+<summary>Page 8 - Skeleton Code</summary>
+
+![Page 8 - Skeleton code and visitor classes](readme_assets/pa2-b2c-type-inference/page-08.png)
+
+</details>
+
+<details>
+<summary>Page 9 - PA #2 B2C Translator</summary>
+
+![Page 9 - PA2 translator requirements and commands](readme_assets/pa2-b2c-type-inference/page-09.png)
+
+</details>
+
+<details>
+<summary>Page 10 - Submission and Grading Policy</summary>
+
+![Page 10 - Submission and grading policy](readme_assets/pa2-b2c-type-inference/page-10.png)
+
+</details>
